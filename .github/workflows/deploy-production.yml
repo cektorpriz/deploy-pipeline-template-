@@ -1,0 +1,146 @@
+name: Deploy Production
+
+on:
+  # Auto-deploy: master moves only by merging a PR from staging (guaranteed by
+  # branch-guard.yml), so the code is already tested on staging.
+  push:
+    branches: [master]
+  # Manual run left for re-deploys / deploys after manual server edits.
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type PRODUCTION to confirm"
+        required: true
+        default: ""
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  APP_PATH: /srv/app                   # absolute path to the app on the server
+  BRANCH: master
+  HEALTH_PORTS: "8080"                 # space-separated ports where /site/health is served
+  EXPECTED_MARKER: "[production]"      # unique string in THIS environment's /site/health response
+
+jobs:
+  deploy:
+    name: Deploy to production via SSH
+    runs-on: ubuntu-22.04
+    steps:
+      # Confirmation is required only for MANUAL runs. Auto-deploys (push to
+      # master) skip this step: code reaches master only via a tested PR.
+      - name: Guard confirmation (manual run only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "PRODUCTION" ]; then
+            echo "::error::Deploy aborted: type PRODUCTION in the confirm field"
+            exit 1
+          fi
+
+      - name: Deploy (port knock + git reset + smoke test)
+        env:
+          SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          SSH_PORT: ${{ secrets.PROD_SSH_PORT }}
+          SSH_USERNAME: ${{ secrets.PROD_SSH_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_PRIVATE_KEY }}
+          KNOCK_SEQUENCE: ${{ secrets.KNOCK_SEQUENCE }}
+        run: |
+          set -euo pipefail
+
+          for v in SSH_HOST SSH_PORT SSH_USERNAME SSH_PRIVATE_KEY; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Missing secret for $v (Settings -> Secrets and variables -> Actions)"
+              exit 1
+            fi
+          done
+
+          KEYFILE=$(mktemp); REMOTE=$(mktemp)
+          trap 'rm -f "$KEYFILE" "$REMOTE"' EXIT
+          echo "$SSH_PRIVATE_KEY" > "$KEYFILE"
+          chmod 600 "$KEYFILE"
+
+          read -r -a KNOCK_PORTS <<< "${KNOCK_SEQUENCE:-}"
+          if [ "${#KNOCK_PORTS[@]}" -eq 0 ]; then
+            echo "::error::KNOCK_SEQUENCE is empty (set three ports, space-separated)"
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq knockd
+
+          cat > "$REMOTE" <<'EOS'
+          set -e
+          cd "$APP_PATH" || { echo "APP_PATH not found: $APP_PATH"; exit 1; }
+          git fetch origin
+          git reset --hard "origin/$BRANCH"
+          rm -rf runtime/cache/* runtime/HTML/* web/assets/* 2>/dev/null || true
+          echo "DEPLOY OK: $(git rev-parse --short HEAD)"
+
+          ALIVE_UNMARKED=0
+          for attempt in 1 2 3 4 5; do
+            for port in $HEALTH_PORTS; do
+              RESP=$(curl -fsS "http://localhost:${port}/site/health" 2>/dev/null || true)
+              echo "  [attempt $attempt] port ${port}: ${RESP:-<no response>}"
+              if echo "$RESP" | grep -qF "$EXPECTED_MARKER"; then
+                echo "SMOKE OK: marker '$EXPECTED_MARKER' confirmed"
+                exit 0
+              fi
+              if echo "$RESP" | grep -q "OK"; then ALIVE_UNMARKED=1; fi
+            done
+            sleep 3
+          done
+
+          if [ "$ALIVE_UNMARKED" -eq 1 ]; then
+            echo "::warning::app answered but marker '$EXPECTED_MARKER' not confirmed (opcache/cache lag)"
+            exit 0
+          fi
+          echo "::error::SMOKE FAILED: no response on ports: $HEALTH_PORTS"
+          exit 2
+          EOS
+
+          OK=0
+          for attempt in 1 2 3; do
+            echo "--- attempt $attempt: port knock + ssh ---"
+            knock "$SSH_HOST" "${KNOCK_PORTS[@]}" || true
+            sleep 2
+            set +e
+            ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+              -i "$KEYFILE" -p "$SSH_PORT" "$SSH_USERNAME@$SSH_HOST" \
+              "APP_PATH='$APP_PATH' BRANCH='$BRANCH' HEALTH_PORTS='$HEALTH_PORTS' EXPECTED_MARKER='$EXPECTED_MARKER' bash -s" < "$REMOTE"
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ]; then OK=1; break; fi
+            if [ "$RC" -ne 255 ]; then
+              echo "::error::Remote script exited with code $RC (not a connection error)."
+              exit "$RC"
+            fi
+            echo "attempt $attempt: connection failed (ssh rc=255), retry in 5s..."
+            sleep 5
+          done
+
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::Could not connect after 3 attempts (knock + ssh)."
+            exit 1
+          fi
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ Deploy production completed! (commit ${SHORT_SHA})"
+          else
+            MSG="❌ Deploy production failed! (commit ${SHORT_SHA}) See: https://github.com/${{ github.repository }}/actions"
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MSG}"
+          else
+            echo "Telegram notification skipped: secrets not configured"
+          fi

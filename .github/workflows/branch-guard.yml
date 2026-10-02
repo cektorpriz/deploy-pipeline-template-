@@ -1,0 +1,24 @@
+name: Branch Guard
+
+on:
+  pull_request:
+    branches: [master]
+
+jobs:
+  guard:
+    name: Only staging -> master
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check source branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "PR: $HEAD_REF -> $BASE_REF"
+          if [ "$BASE_REF" = "master" ] && [ "$HEAD_REF" != "staging" ]; then
+            echo "::error::master accepts changes only from the staging branch."
+            echo "::error::Current PR: $HEAD_REF -> $BASE_REF."
+            echo "::error::Change the base to staging (or open a PR from staging)."
+            exit 1
+          fi
+          echo "OK: $HEAD_REF -> $BASE_REF"

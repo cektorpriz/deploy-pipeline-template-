@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master, staging]
+
+jobs:
+  lint:
+    name: PHP lint + composer validate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"   # adjust to your project's PHP version
+          tools: composer
+
+      - name: Lint tracked PHP files
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            php -l "$file" >/dev/null
+            echo "OK  $file"
+          done < <(git ls-files -z '*.php')
+
+      - name: Validate composer.json
+        run: composer validate --no-check-publish --no-interaction
+
+  quality:
+    name: PHPStan + Codeception
+    runs-on: ubuntu-22.04
+    services:
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: app_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+          tools: composer
+          extensions: pdo, pdo_mysql, mbstring, intl, gd, zip, xml, curl, iconv
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/composer
+          key: composer-cache-php74-${{ hashFiles('composer.json') }}
+          restore-keys: composer-cache-php74-
+
+      # composer.lock should be committed: install resolves the exact same
+      # versions as production. Never run `composer update` in CI.
+      - name: Install dependencies
+        run: |
+          if [ ! -f composer.lock ]; then
+            echo "::error::composer.lock missing. Generate it locally and commit it."
+            exit 1
+          fi
+          composer install --no-interaction --prefer-dist --no-progress
+
+      - name: PHPStan static analysis
+        run: vendor/bin/phpstan analyse --no-progress --memory-limit=512M
+
+      # Codeception actor classes are generated, not committed.
+      - name: Build Codeception actors
+        run: vendor/bin/codecept build
+
+      - name: Run Codeception functional tests
+        env:
+          # MariaDB service is reachable over TCP on 127.0.0.1
+          # ("localhost" in PHP maps to a unix socket that does not exist here).
+          TEST_DB_DSN: "mysql:host=127.0.0.1;port=3306;dbname=app_test"
+          TEST_DB_USERNAME: root
+          TEST_DB_PASSWORD: ""
+        run: vendor/bin/codecept run functional --steps

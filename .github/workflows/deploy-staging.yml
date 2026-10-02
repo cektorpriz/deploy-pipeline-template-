@@ -1,0 +1,138 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches: [staging]
+
+# One deploy at a time per environment — prevents races on double pushes.
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+env:
+  APP_PATH: /srv/app-staging        # absolute path to the app on the server
+  BRANCH: staging
+  HEALTH_PORTS: "8081"              # space-separated ports where /site/health is served
+  EXPECTED_MARKER: "[staging]"      # unique string in THIS environment's /site/health response
+
+jobs:
+  deploy:
+    name: Deploy to staging via SSH
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Deploy (port knock + git reset + smoke test)
+        env:
+          SSH_HOST: ${{ secrets.STAGING_SSH_HOST }}
+          SSH_PORT: ${{ secrets.STAGING_SSH_PORT }}
+          SSH_USERNAME: ${{ secrets.STAGING_SSH_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.STAGING_SSH_PRIVATE_KEY }}
+          KNOCK_SEQUENCE: ${{ secrets.KNOCK_SEQUENCE }}
+        run: |
+          set -euo pipefail
+
+          # A missing secret would otherwise surface as a confusing ssh timeout.
+          for v in SSH_HOST SSH_PORT SSH_USERNAME SSH_PRIVATE_KEY; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::Missing secret for $v (Settings -> Secrets and variables -> Actions)"
+              exit 1
+            fi
+          done
+
+          KEYFILE=$(mktemp); REMOTE=$(mktemp)
+          trap 'rm -f "$KEYFILE" "$REMOTE"' EXIT
+          echo "$SSH_PRIVATE_KEY" > "$KEYFILE"
+          chmod 600 "$KEYFILE"
+
+          read -r -a KNOCK_PORTS <<< "${KNOCK_SEQUENCE:-}"
+          if [ "${#KNOCK_PORTS[@]}" -eq 0 ]; then
+            echo "::error::KNOCK_SEQUENCE is empty (set three ports, space-separated)"
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq knockd
+
+          # Script that runs ON THE SERVER (stdin). Values are injected as env
+          # vars in the ssh command, so this heredoc stays literal (quoted).
+          cat > "$REMOTE" <<'EOS'
+          set -e
+          cd "$APP_PATH" || { echo "APP_PATH not found: $APP_PATH"; exit 1; }
+          git fetch origin
+          git reset --hard "origin/$BRANCH"
+          rm -rf runtime/cache/* runtime/HTML/* web/assets/* 2>/dev/null || true
+          echo "DEPLOY OK: $(git rev-parse --short HEAD)"
+
+          # Smoke test: verify THIS environment answered (marker), not a sibling
+          # that happens to share the host. Retry a few times because opcache /
+          # a cache in front of the app may still serve the old response.
+          ALIVE_UNMARKED=0
+          for attempt in 1 2 3 4 5; do
+            for port in $HEALTH_PORTS; do
+              RESP=$(curl -fsS "http://localhost:${port}/site/health" 2>/dev/null || true)
+              echo "  [attempt $attempt] port ${port}: ${RESP:-<no response>}"
+              if echo "$RESP" | grep -qF "$EXPECTED_MARKER"; then
+                echo "SMOKE OK: marker '$EXPECTED_MARKER' confirmed"
+                exit 0
+              fi
+              if echo "$RESP" | grep -q "OK"; then ALIVE_UNMARKED=1; fi
+            done
+            sleep 3
+          done
+
+          if [ "$ALIVE_UNMARKED" -eq 1 ]; then
+            echo "::warning::app answered but marker '$EXPECTED_MARKER' not confirmed (opcache/cache lag)"
+            exit 0
+          fi
+          echo "::error::SMOKE FAILED: no response on ports: $HEALTH_PORTS"
+          exit 2
+          EOS
+
+          # knock + ssh with retries. knockd occasionally misses the knock or it
+          # gets dropped in transit, so the first attempt can time out. Retry
+          # ONLY connection errors (ssh exit code 255); if the remote script
+          # returned its own code we are already on the server and retrying
+          # would just repeat the git reset.
+          OK=0
+          for attempt in 1 2 3; do
+            echo "--- attempt $attempt: port knock + ssh ---"
+            knock "$SSH_HOST" "${KNOCK_PORTS[@]}" || true
+            sleep 2
+            set +e
+            ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+              -i "$KEYFILE" -p "$SSH_PORT" "$SSH_USERNAME@$SSH_HOST" \
+              "APP_PATH='$APP_PATH' BRANCH='$BRANCH' HEALTH_PORTS='$HEALTH_PORTS' EXPECTED_MARKER='$EXPECTED_MARKER' bash -s" < "$REMOTE"
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ]; then OK=1; break; fi
+            if [ "$RC" -ne 255 ]; then
+              echo "::error::Remote script exited with code $RC (not a connection error)."
+              exit "$RC"
+            fi
+            echo "attempt $attempt: connection failed (ssh rc=255), retry in 5s..."
+            sleep 5
+          done
+
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::Could not connect after 3 attempts (knock + ssh)."
+            exit 1
+          fi
+
+      - name: Notify Telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            MSG="✅ Deploy staging completed!"
+          else
+            MSG="❌ Deploy staging failed! See: https://github.com/${{ github.repository }}/actions"
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=${MSG}"
+          else
+            echo "Telegram notification skipped: secrets not configured"
+          fi
